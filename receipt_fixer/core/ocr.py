@@ -19,9 +19,6 @@ def _check_tesseract() -> None:
         raise EnvironmentError(_WINDOWS_INSTALL_MSG)
 
 
-_check_tesseract()
-
-
 @dataclass
 class OcrResult:
     raw_text: str
@@ -31,6 +28,7 @@ class OcrResult:
 
 def extract_text(png_path: Path) -> OcrResult:
     """Run Tesseract on *png_path* and return raw text with file-level confidence."""
+    _check_tesseract()
     img = Image.open(png_path)
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
