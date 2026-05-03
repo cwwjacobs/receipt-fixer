@@ -10,7 +10,7 @@ from receipt_fixer.core.scanner import scan_input_folder
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
 
-def main(folder: str, normalize: bool = False) -> None:
+def main(folder: str, normalize: bool = False, ocr: bool = False) -> None:
     path = Path(folder)
     files = scan_input_folder(path)
 
@@ -30,19 +30,36 @@ def main(folder: str, normalize: bool = False) -> None:
     summary = ", ".join(parts) if parts else "none"
     print(f"Found {total} files: {summary}")
 
-    if normalize:
+    if normalize or ocr:
+        if ocr:
+            try:
+                from receipt_fixer.core.ocr import extract_text
+            except EnvironmentError as exc:
+                print(f"ERROR: {exc}")
+                sys.exit(1)
+
         with tempfile.TemporaryDirectory(prefix="receipt_fixer_") as tmp:
             work_dir = Path(tmp)
-            ok = skipped = 0
+            norm_ok = norm_skip = 0
             for rf in files:
                 try:
                     out = normalize_to_png(rf, work_dir)
-                    print(f"  normalized: {rf.path.name} -> {out.name}")
-                    ok += 1
+                    norm_ok += 1
+                    if normalize:
+                        print(f"  normalized: {rf.path.name} -> {out.name}")
+                    if ocr:
+                        result = extract_text(out)
+                        print(
+                            f"  [{rf.path.name}] conf={result.confidence:.1f}% "
+                            f"words={result.word_count}"
+                        )
+                        print(f"    {result.raw_text[:200]!r}")
                 except UnsupportedFormatError as exc:
-                    print(f"  skipped:    {rf.path.name} ({exc})")
-                    skipped += 1
-            print(f"Normalize complete: {ok} ok, {skipped} skipped.")
+                    norm_skip += 1
+                    print(f"  skipped: {rf.path.name} ({exc})")
+
+            if normalize:
+                print(f"Normalize complete: {norm_ok} ok, {norm_skip} skipped.")
 
 
 if __name__ == "__main__":
@@ -53,7 +70,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--normalize",
         action="store_true",
-        help="Also normalize each file to PNG in a temp work dir",
+        help="Normalize each file to PNG in a temp work dir",
+    )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Scan + normalize + OCR each file and print extracted text",
     )
     args = parser.parse_args()
-    main(args.folder, normalize=args.normalize)
+    main(args.folder, normalize=args.normalize, ocr=args.ocr)
