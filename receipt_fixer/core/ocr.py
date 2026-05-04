@@ -1,22 +1,41 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytesseract
 from PIL import Image
 
-_WINDOWS_INSTALL_MSG = (
-    "Tesseract OCR binary not found.\n"
-    "Install it from: https://github.com/UB-Mannheim/tesseract/wiki\n"
-    "Then add the install folder (e.g. C:\\Program Files\\Tesseract-OCR) to PATH."
-)
+
+def tesseract_install_hint() -> str:
+    """Return install instructions appropriate to the current OS."""
+    if sys.platform.startswith("win"):
+        return (
+            "Install Tesseract from:\n"
+            "  https://github.com/UB-Mannheim/tesseract/wiki\n"
+            "Then add the install folder (e.g. C:\\Program Files\\Tesseract-OCR) "
+            "to your PATH."
+        )
+    if sys.platform == "darwin":
+        return (
+            "Install Tesseract via Homebrew:\n"
+            "  brew install tesseract"
+        )
+    return (
+        "Install Tesseract via your package manager:\n"
+        "  Debian/Ubuntu: sudo apt install tesseract-ocr\n"
+        "  Fedora:        sudo dnf install tesseract\n"
+        "  Arch:          sudo pacman -S tesseract"
+    )
 
 
 def _check_tesseract() -> None:
     if shutil.which("tesseract") is None:
-        raise EnvironmentError(_WINDOWS_INSTALL_MSG)
+        raise EnvironmentError(
+            "Tesseract OCR binary not found.\n\n" + tesseract_install_hint()
+        )
 
 
 @dataclass
