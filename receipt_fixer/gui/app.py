@@ -1,37 +1,54 @@
-"""Tkinter desktop GUI for Receipt Fixer.
+"""FixDrawer: Receipt Fixer — Tkinter desktop GUI.
 
-Thin shell over receipt_fixer.core.* — all business logic stays in core.
-The conversion runs in a worker thread that communicates with the main
-loop via a thread-safe queue, polled every 50 ms.
+Thin shell over receipt_fixer.core.* — all business logic stays in
+core. The conversion runs in a worker thread that talks to the main
+loop through a thread-safe queue, polled every 50 ms.
+
+Brand-voice contract: log headers are direct and technical
+(VERIFICATION RUN, VERIFICATION PASSED, FAILURE FOUND,
+FAILURE RISK CHECK). No apologies, no marketing copy.
 """
 from __future__ import annotations
 
+import csv
 import logging
-import os
 import queue
-import subprocess
 import sys
 import tempfile
 import threading
 import tkinter as tk
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from fixdrawer_app_base import (
+    ReadOnlyTextPanel,
+    find_asset,
+    folder_open_action,
+)
+
 from receipt_fixer.core.normalize import (
     UnsupportedFormatError,
     normalize_to_png,
 )
 from receipt_fixer.core.scanner import scan_input_folder
+from receipt_fixer.release import APP_BRAND, APP_NAME, APP_VERSION
 
 POLL_INTERVAL_MS = 50
-DEFAULT_THRESHOLD = 60
 DEFAULT_CSV_NAME = "receipts.csv"
-WINDOW_TITLE = "Receipt Fixer"
-WINDOW_DEFAULT_SIZE = "720x520"
-WINDOW_MIN_SIZE = (640, 460)
+LOGO_REL_PATH = "receipt_fixer/assets/receipt_fixer_logo.png"
+WINDOW_DEFAULT_SIZE = "780x680"
+WINDOW_MIN_SIZE = (720, 600)
+LOG_PANEL_ROWS = 13
+PREVIEW_PANEL_ROWS = 7
+TAGLINE = (
+    "Receipt photos → spreadsheet-ready CSV\n"
+    "Local only. No cloud. No account. No subscription."
+)
+SECTION_RULE = "─" * 60
 
 logger = logging.getLogger(__name__)
 
@@ -46,136 +63,145 @@ class _LogMsg:
 
 
 @dataclass
-class _ProgressInit:
-    total: int
-
-
-@dataclass
-class _ProgressTick:
-    current: int
-
-
-@dataclass
 class _DoneMsg:
     csv_path: Path
     receipt_path: Path
     seen: int
-    rows: int
+    rows_in_csv: int
+    fully: int
+    partial: int
     skipped: int
     failed: int
-    low_conf: int
 
 
 @dataclass
-class _ErrorMsg:
-    title: str
+class _FailureMsg:
+    what_failed: str
     detail: str
+    customer_impact: str
+    required_fix: str
 
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _open_in_file_manager(path: Path) -> None:
-    """Open *path* in the OS file manager. Best-effort, never raises."""
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
-    except Exception as exc:
-        logger.warning("could not open file manager for %s: %s", path, exc)
-
-
 def _run_pipeline(
     folder: Path,
     csv_path: Path,
     receipt_path: Path,
     force: bool,
-    threshold: float,
     q: "queue.Queue",
 ) -> None:
-    """Worker entry point. Runs scan → normalize → OCR → extract → write."""
-    # Imports that depend on Tesseract are lazy so the GUI starts even if
-    # the binary is missing — we only fail when the user clicks Convert.
-    from receipt_fixer.core.ocr import _check_tesseract, extract_text
+    """Worker entry: scan → normalize → OCR → extract → write CSV + receipt."""
+    from receipt_fixer.core.ocr import (
+        _check_tesseract,
+        extract_text,
+        tesseract_install_hint,
+    )
     from receipt_fixer.core.extract import extract_fields
     from receipt_fixer.core.output import (
         CsvExistsError,
         CsvRow,
         CsvVerificationError,
+        sha256_file,
         write_csv,
         write_verification_receipt,
     )
 
     try:
         _check_tesseract()
-    except EnvironmentError as exc:
-        q.put(_ErrorMsg(title="Tesseract not found", detail=str(exc)))
+    except EnvironmentError:
+        q.put(_FailureMsg(
+            what_failed="Tesseract OCR binary not found on PATH",
+            detail=tesseract_install_hint(),
+            customer_impact="Cannot read text from receipt images.",
+            required_fix="Install Tesseract using the steps above and relaunch.",
+        ))
         return
 
     try:
         files = scan_input_folder(folder)
-    except Exception as exc:
-        q.put(_ErrorMsg(title="Could not scan folder", detail=str(exc)))
+    except Exception as exc:  # noqa: BLE001
+        q.put(_FailureMsg(
+            what_failed="Could not scan input folder",
+            detail=str(exc),
+            customer_impact="No CSV produced.",
+            required_fix=f"Confirm {folder} exists and is readable.",
+        ))
         return
 
-    q.put(_LogMsg(f"Found {len(files)} files in {folder}"))
-    q.put(_ProgressInit(total=max(len(files), 1)))
+    q.put(_LogMsg(""))
+    q.put(_LogMsg("VERIFICATION RUN"))
+    q.put(_LogMsg(SECTION_RULE))
+    q.put(_LogMsg(f"Input folder:  {folder}"))
+    q.put(_LogMsg(f"Output CSV:    {csv_path}"))
+    q.put(_LogMsg(f"Files seen:    {len(files)}"))
+    q.put(_LogMsg(""))
 
     rows: list[CsvRow] = []
-    seen = skipped = failed = low_conf = 0
+    seen = fully = partial = skipped = failed = 0
 
     with tempfile.TemporaryDirectory(prefix="receipt_fixer_") as tmp:
         work_dir = Path(tmp)
         for i, rf in enumerate(files, start=1):
             seen += 1
+            label = f"[{i}/{len(files)}] {rf.path.name}"
             try:
                 norm = normalize_to_png(rf, work_dir)
                 ocr_result = extract_text(norm)
                 extracted = extract_fields(ocr_result)
                 row = CsvRow.from_extracted(rf.path.name, extracted)
                 rows.append(row)
-
                 conf = extracted.confidence
-                if conf < threshold:
-                    low_conf += 1
-                    q.put(_LogMsg(
-                        f"  LOW  conf={conf:.1f}  {rf.path.name}"
-                    ))
-                elif extracted.amount is None or extracted.date is None:
-                    q.put(_LogMsg(
-                        f"  partial  conf={conf:.1f}  {rf.path.name}  "
-                        f"({'; '.join(extracted.reasons) or 'missing fields'})"
-                    ))
+                if extracted.amount is not None and extracted.date is not None:
+                    fully += 1
+                    q.put(_LogMsg(f"{label}  ok       conf={conf:.1f}"))
                 else:
+                    partial += 1
+                    reason = "; ".join(extracted.reasons) or "missing fields"
                     q.put(_LogMsg(
-                        f"  ok    conf={conf:.1f}  {rf.path.name}"
+                        f"{label}  partial  conf={conf:.1f}  ({reason})"
                     ))
             except UnsupportedFormatError as exc:
                 skipped += 1
                 rows.append(CsvRow.skipped(rf.path.name, str(exc)))
-                q.put(_LogMsg(f"  skip  {rf.path.name} ({exc})"))
-            except Exception as exc:
+                q.put(_LogMsg(f"{label}  skip     ({exc})"))
+            except Exception as exc:  # noqa: BLE001
                 failed += 1
-                q.put(_LogMsg(f"  FAIL  {rf.path.name} ({exc})"))
-            q.put(_ProgressTick(current=i))
+                q.put(_LogMsg(f"{label}  FAIL     ({exc})"))
 
     try:
         write_csv(rows, csv_path, force=force)
     except CsvExistsError as exc:
-        q.put(_ErrorMsg(title="Output file exists", detail=str(exc)))
-        return
-    except CsvVerificationError as exc:
-        q.put(_ErrorMsg(
-            title="CSV verification failed",
-            detail=f"The output CSV did not pass post-write verification.\n\n{exc}",
+        q.put(_FailureMsg(
+            what_failed="Output CSV already exists",
+            detail=str(exc),
+            customer_impact="Previous run preserved; no new CSV written.",
+            required_fix="Choose a different output path or confirm overwrite.",
         ))
         return
-    except Exception as exc:
-        q.put(_ErrorMsg(title="Could not write CSV", detail=str(exc)))
+    except CsvVerificationError as exc:
+        q.put(_FailureMsg(
+            what_failed="Post-write CSV verification failed",
+            detail=str(exc),
+            customer_impact=(
+                "Refusing to deliver a CSV that does not pass its own "
+                "integrity check."
+            ),
+            required_fix=(
+                "Re-run; if this persists, capture the input folder and "
+                "open an issue."
+            ),
+        ))
+        return
+    except Exception as exc:  # noqa: BLE001
+        q.put(_FailureMsg(
+            what_failed="Could not write CSV",
+            detail=f"{type(exc).__name__}: {exc}",
+            customer_impact="No CSV produced.",
+            required_fix=f"Check write permissions on {csv_path.parent}.",
+        ))
         return
 
     try:
@@ -186,22 +212,59 @@ def _run_pipeline(
             rows=rows,
             receipt_path=receipt_path,
         )
-    except Exception as exc:
-        q.put(_ErrorMsg(
-            title="Could not write verification receipt",
-            detail=str(exc),
+    except Exception as exc:  # noqa: BLE001
+        q.put(_FailureMsg(
+            what_failed="Could not write verification receipt",
+            detail=f"{type(exc).__name__}: {exc}",
+            customer_impact=(
+                "CSV is on disk but its verification receipt is missing."
+            ),
+            required_fix=f"Check write permissions on {receipt_path.parent}.",
         ))
         return
+
+    csv_sha = sha256_file(csv_path)
+    q.put(_LogMsg(""))
+    q.put(_LogMsg("VERIFICATION PASSED"))
+    q.put(_LogMsg(SECTION_RULE))
+    q.put(_LogMsg(f"Files seen:        {seen}"))
+    q.put(_LogMsg(f"Rows in CSV:       {len(rows)}"))
+    q.put(_LogMsg(f"  fully extracted: {fully}"))
+    q.put(_LogMsg(f"  partial:         {partial}"))
+    q.put(_LogMsg(f"  skipped:         {skipped}"))
+    q.put(_LogMsg(f"  failed:          {failed}"))
+    q.put(_LogMsg(f"Output CSV:        {csv_path}"))
+    q.put(_LogMsg(f"SHA-256:           {csv_sha}"))
+    q.put(_LogMsg(f"Receipt:           {receipt_path}"))
 
     q.put(_DoneMsg(
         csv_path=csv_path,
         receipt_path=receipt_path,
         seen=seen,
-        rows=len(rows),
+        rows_in_csv=len(rows),
+        fully=fully,
+        partial=partial,
         skipped=skipped,
         failed=failed,
-        low_conf=low_conf,
     ))
+
+
+# ---------------------------------------------------------------------------
+# CSV preview helper
+# ---------------------------------------------------------------------------
+
+def _read_preview(csv_path: Path, max_rows: int = 7) -> str:
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = []
+            for i, row in enumerate(reader):
+                if i > max_rows:
+                    break
+                rows.append(" | ".join(row))
+            return "\n".join(rows)
+    except Exception as exc:  # noqa: BLE001
+        return f"(could not preview CSV: {exc})"
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +274,7 @@ def _run_pipeline(
 class ReceiptFixerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title(WINDOW_TITLE)
+        root.title(f"{APP_BRAND}: {APP_NAME} v{APP_VERSION}")
         root.geometry(WINDOW_DEFAULT_SIZE)
         root.minsize(*WINDOW_MIN_SIZE)
 
@@ -219,7 +282,8 @@ class ReceiptFixerApp:
         self._csv: Optional[Path] = None
         self._queue: "queue.Queue" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
-        self._last_output_folder: Optional[Path] = None
+        self._last_csv: Optional[Path] = None
+        self._logo_image: Optional[tk.PhotoImage] = None  # keep ref alive
 
         self._build_ui()
         self._update_convert_state()
@@ -227,107 +291,99 @@ class ReceiptFixerApp:
     # --- layout ---------------------------------------------------------
 
     def _build_ui(self) -> None:
-        pad = {"padx": 12, "pady": 6}
-
         outer = ttk.Frame(self.root)
-        outer.pack(fill="both", expand=True, padx=10, pady=10)
+        outer.pack(fill="both", expand=True, padx=18, pady=14)
         outer.columnconfigure(0, weight=1)
 
-        # --- Input folder ---
-        in_frame = ttk.LabelFrame(outer, text="Input folder")
-        in_frame.grid(row=0, column=0, sticky="ew", **pad)
-        in_frame.columnconfigure(1, weight=1)
+        # --- Logo (placeholder if absent) ---
+        logo_path = find_asset(LOGO_REL_PATH)
+        if logo_path is not None:
+            try:
+                self._logo_image = tk.PhotoImage(file=str(logo_path))
+                ttk.Label(outer, image=self._logo_image).grid(
+                    row=0, column=0, pady=(0, 4)
+                )
+            except tk.TclError as exc:
+                logger.warning("could not load logo at %s: %s", logo_path, exc)
 
+        # --- App name ---
+        ttk.Label(
+            outer, text=APP_NAME, font=("Helvetica", 22, "bold")
+        ).grid(row=1, column=0, pady=(2, 2))
+
+        # --- Tagline ---
+        ttk.Label(
+            outer, text=TAGLINE, justify="center",
+            font=("Helvetica", 10),
+        ).grid(row=2, column=0, pady=(0, 12))
+
+        # --- Folder picker row ---
+        folder_row = ttk.Frame(outer)
+        folder_row.grid(row=3, column=0, sticky="ew", pady=4)
+        folder_row.columnconfigure(1, weight=1)
         ttk.Button(
-            in_frame, text="Choose folder…", command=self._choose_folder
-        ).grid(row=0, column=0, padx=8, pady=8)
-        self._folder_label = ttk.Label(in_frame, text="(none selected)")
-        self._folder_label.grid(row=0, column=1, sticky="w", padx=4, pady=8)
+            folder_row, text="Choose folder of receipts",
+            command=self._choose_folder,
+        ).grid(row=0, column=0, padx=(0, 8))
+        self._folder_label = ttk.Label(folder_row, text="(none selected)")
+        self._folder_label.grid(row=0, column=1, sticky="w")
 
-        # --- Output CSV ---
-        out_frame = ttk.LabelFrame(outer, text="Output CSV")
-        out_frame.grid(row=1, column=0, sticky="ew", **pad)
-        out_frame.columnconfigure(1, weight=1)
-
+        # --- Output CSV picker row ---
+        csv_row = ttk.Frame(outer)
+        csv_row.grid(row=4, column=0, sticky="ew", pady=4)
+        csv_row.columnconfigure(1, weight=1)
         ttk.Button(
-            out_frame, text="Choose file…", command=self._choose_csv
-        ).grid(row=0, column=0, padx=8, pady=8)
-        self._csv_label = ttk.Label(out_frame, text="(none selected)")
-        self._csv_label.grid(row=0, column=1, sticky="w", padx=4, pady=8)
+            csv_row, text="Choose Output CSV",
+            command=self._choose_csv,
+        ).grid(row=0, column=0, padx=(0, 8))
+        self._csv_label = ttk.Label(csv_row, text="(none selected)")
+        self._csv_label.grid(row=0, column=1, sticky="w")
 
-        # --- Confidence threshold ---
-        thr_frame = ttk.LabelFrame(outer, text="Confidence threshold")
-        thr_frame.grid(row=2, column=0, sticky="ew", **pad)
-        thr_frame.columnconfigure(0, weight=1)
+        # --- Action buttons ---
+        action_row = ttk.Frame(outer)
+        action_row.grid(row=5, column=0, sticky="ew", pady=(12, 8))
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(1, weight=0)
 
-        self._threshold_var = tk.IntVar(value=DEFAULT_THRESHOLD)
-        self._threshold_label = ttk.Label(
-            thr_frame, text=str(DEFAULT_THRESHOLD), width=4, anchor="e"
+        self._convert_btn = tk.Button(
+            action_row, text="Convert and Verify",
+            command=self._on_convert,
+            font=("Helvetica", 12, "bold"),
+            padx=12, pady=6,
         )
-        slider = ttk.Scale(
-            thr_frame, from_=0, to=100, orient="horizontal",
-            command=self._on_threshold_change,
-        )
-        slider.set(DEFAULT_THRESHOLD)
-        slider.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        self._threshold_label.grid(row=0, column=1, padx=8, pady=8)
-
-        # --- Convert + progress ---
-        action_frame = ttk.Frame(outer)
-        action_frame.grid(row=3, column=0, sticky="ew", **pad)
-        action_frame.columnconfigure(1, weight=1)
-
-        self._convert_btn = ttk.Button(
-            action_frame, text="Convert", command=self._on_convert
-        )
-        self._convert_btn.grid(row=0, column=0, padx=4, pady=4)
-
-        self._progress = ttk.Progressbar(
-            action_frame, mode="determinate", maximum=1
-        )
-        self._progress.grid(row=0, column=1, sticky="ew", padx=8, pady=4)
-
-        # --- Status log ---
-        log_frame = ttk.LabelFrame(outer, text="Status")
-        log_frame.grid(row=4, column=0, sticky="nsew", **pad)
-        outer.rowconfigure(4, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
-
-        self._log_text = tk.Text(
-            log_frame, height=10, wrap="word", state="disabled",
-            font=("TkFixedFont",),
-        )
-        self._log_text.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        log_scroll = ttk.Scrollbar(
-            log_frame, orient="vertical", command=self._log_text.yview
-        )
-        log_scroll.grid(row=0, column=1, sticky="ns")
-        self._log_text.configure(yscrollcommand=log_scroll.set)
-
-        # --- Summary banner + open output folder ---
-        self._summary_var = tk.StringVar(value="")
-        summary_frame = ttk.Frame(outer)
-        summary_frame.grid(row=5, column=0, sticky="ew", **pad)
-        summary_frame.columnconfigure(0, weight=1)
-
-        self._summary_label = ttk.Label(
-            summary_frame, textvariable=self._summary_var,
-            foreground="#0a6", anchor="w",
-        )
-        self._summary_label.grid(row=0, column=0, sticky="ew")
+        self._convert_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         self._open_btn = ttk.Button(
-            summary_frame, text="Open output folder",
-            command=self._on_open_output,
+            action_row, text="Open Output Folder",
+            command=folder_open_action(self._output_folder_supplier),
             state="disabled",
         )
-        self._open_btn.grid(row=0, column=1, padx=4)
+        self._open_btn.grid(row=0, column=1)
 
-    # --- event handlers --------------------------------------------------
+        # --- Verification log panel ---
+        ttk.Label(outer, text="Verification log:").grid(
+            row=6, column=0, sticky="w", pady=(8, 2)
+        )
+        self._log_panel = ReadOnlyTextPanel(
+            outer, height=LOG_PANEL_ROWS, wrap="word"
+        )
+        self._log_panel.grid(row=7, column=0, sticky="nsew", pady=(0, 8))
+        outer.rowconfigure(7, weight=3)
+
+        # --- Verified preview panel ---
+        ttk.Label(outer, text="Verified output preview:").grid(
+            row=8, column=0, sticky="w", pady=(4, 2)
+        )
+        self._preview_panel = ReadOnlyTextPanel(
+            outer, height=PREVIEW_PANEL_ROWS, wrap="none"
+        )
+        self._preview_panel.grid(row=9, column=0, sticky="nsew")
+        outer.rowconfigure(9, weight=1)
+
+    # --- handlers --------------------------------------------------------
 
     def _choose_folder(self) -> None:
-        chosen = filedialog.askdirectory(title="Choose input folder")
+        chosen = filedialog.askdirectory(title="Choose folder of receipts")
         if chosen:
             self._folder = Path(chosen)
             self._folder_label.configure(text=str(self._folder))
@@ -335,24 +391,16 @@ class ReceiptFixerApp:
 
     def _choose_csv(self) -> None:
         chosen = filedialog.asksaveasfilename(
-            title="Choose output CSV",
+            title="Choose Output CSV",
             defaultextension=".csv",
             initialfile=DEFAULT_CSV_NAME,
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            confirmoverwrite=False,  # we do our own confirm via CsvExistsError path
+            confirmoverwrite=False,  # we run our own FAILURE RISK CHECK
         )
         if chosen:
             self._csv = Path(chosen)
             self._csv_label.configure(text=str(self._csv))
             self._update_convert_state()
-
-    def _on_threshold_change(self, value: str) -> None:
-        try:
-            ival = int(round(float(value)))
-        except ValueError:
-            return
-        self._threshold_var.set(ival)
-        self._threshold_label.configure(text=str(ival))
 
     def _on_convert(self) -> None:
         if self._folder is None or self._csv is None:
@@ -363,46 +411,50 @@ class ReceiptFixerApp:
         force = False
         if self._csv.exists():
             if not messagebox.askyesno(
-                title="Overwrite existing file?",
+                title="FAILURE RISK CHECK",
                 message=(
                     f"{self._csv} already exists.\n\n"
-                    f"Overwrite it? The previous CSV will be lost."
+                    f"Overwriting will destroy the previous CSV and its "
+                    f"verification receipt. Proceed?"
                 ),
                 icon="warning",
             ):
+                self._log_panel.append("FAILURE RISK CHECK declined — run aborted.")
                 return
             force = True
 
         receipt_path = self._csv.with_suffix(self._csv.suffix + ".receipt.txt")
 
-        # Reset UI state for a new run.
-        self._set_log("")
-        self._summary_var.set("")
-        self._progress.configure(value=0, maximum=1)
+        self._log_panel.clear()
+        self._preview_panel.clear()
         self._open_btn.configure(state="disabled")
         self._convert_btn.configure(state="disabled")
-        self._append_log(f"Starting conversion: {self._folder} → {self._csv}")
 
         self._worker = threading.Thread(
-            target=_run_pipeline,
+            target=self._worker_entry,
             kwargs={
                 "folder": self._folder,
                 "csv_path": self._csv,
                 "receipt_path": receipt_path,
                 "force": force,
-                "threshold": float(self._threshold_var.get()),
-                "q": self._queue,
             },
             daemon=True,
         )
         self._worker.start()
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
 
-    def _on_open_output(self) -> None:
-        if self._last_output_folder is not None:
-            _open_in_file_manager(self._last_output_folder)
+    def _worker_entry(self, **kwargs) -> None:
+        try:
+            _run_pipeline(q=self._queue, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self._queue.put(_FailureMsg(
+                what_failed=f"Unhandled {type(exc).__name__} in worker",
+                detail=traceback.format_exc(),
+                customer_impact="Conversion did not complete.",
+                required_fix="Capture the trace above and open an issue.",
+            ))
 
-    # --- queue polling ---------------------------------------------------
+    # --- queue polling --------------------------------------------------
 
     def _poll_queue(self) -> None:
         finished = False
@@ -410,67 +462,63 @@ class ReceiptFixerApp:
             while True:
                 msg = self._queue.get_nowait()
                 if isinstance(msg, _LogMsg):
-                    self._append_log(msg.text)
-                elif isinstance(msg, _ProgressInit):
-                    self._progress.configure(value=0, maximum=msg.total)
-                elif isinstance(msg, _ProgressTick):
-                    self._progress.configure(value=msg.current)
+                    self._log_panel.append(msg.text)
                 elif isinstance(msg, _DoneMsg):
                     self._handle_done(msg)
                     finished = True
-                elif isinstance(msg, _ErrorMsg):
-                    self._handle_error(msg)
+                elif isinstance(msg, _FailureMsg):
+                    self._handle_failure(msg)
                     finished = True
         except queue.Empty:
             pass
 
-        if finished or (self._worker is not None and not self._worker.is_alive()
-                        and self._queue.empty()):
+        worker_done = self._worker is not None and not self._worker.is_alive()
+        if finished or (worker_done and self._queue.empty()):
             self._convert_btn.configure(state=self._convert_state())
             return
 
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
 
     def _handle_done(self, msg: _DoneMsg) -> None:
-        self._append_log("")
-        self._append_log(f"Wrote CSV:     {msg.csv_path}")
-        self._append_log(f"Wrote receipt: {msg.receipt_path}")
-        self._summary_var.set(
-            f"Done. Files seen: {msg.seen} · Rows written: {msg.rows} · "
-            f"Skipped: {msg.skipped} · Failed: {msg.failed} · "
-            f"Low confidence: {msg.low_conf}"
-        )
-        self._last_output_folder = msg.csv_path.parent
+        self._last_csv = msg.csv_path
+        preview = _read_preview(msg.csv_path, max_rows=PREVIEW_PANEL_ROWS - 1)
+        self._preview_panel.set_text(preview)
         self._open_btn.configure(state="normal")
 
-    def _handle_error(self, msg: _ErrorMsg) -> None:
-        self._append_log(f"ERROR: {msg.title} — {msg.detail}")
-        messagebox.showerror(title=msg.title, message=msg.detail)
+    def _handle_failure(self, msg: _FailureMsg) -> None:
+        self._log_panel.append("")
+        self._log_panel.append("FAILURE FOUND")
+        self._log_panel.append(SECTION_RULE)
+        self._log_panel.append(f"What failed:      {msg.what_failed}")
+        for line in msg.detail.splitlines() or [""]:
+            self._log_panel.append(f"Detail:           {line}" if line else "")
+        self._log_panel.append(f"Customer impact:  {msg.customer_impact}")
+        self._log_panel.append(f"Required fix:     {msg.required_fix}")
+        messagebox.showerror(
+            title="FAILURE FOUND",
+            message=f"{msg.what_failed}\n\n{msg.detail}",
+        )
 
-    # --- helpers ---------------------------------------------------------
+    # --- helpers --------------------------------------------------------
 
-    def _set_log(self, text: str) -> None:
-        self._log_text.configure(state="normal")
-        self._log_text.delete("1.0", "end")
-        if text:
-            self._log_text.insert("end", text)
-        self._log_text.configure(state="disabled")
-
-    def _append_log(self, line: str) -> None:
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", line + "\n")
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+    def _output_folder_supplier(self) -> Optional[Path]:
+        return self._last_csv.parent if self._last_csv is not None else None
 
     def _convert_state(self) -> str:
-        return "normal" if self._folder is not None and self._csv is not None else "disabled"
+        return (
+            "normal"
+            if self._folder is not None and self._csv is not None
+            else "disabled"
+        )
 
     def _update_convert_state(self) -> None:
         self._convert_btn.configure(state=self._convert_state())
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING, format="%(levelname)s: %(message)s"
+    )
     root = tk.Tk()
     ReceiptFixerApp(root)
     root.mainloop()
