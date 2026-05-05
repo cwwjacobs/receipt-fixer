@@ -32,6 +32,16 @@ htmlcov/
 # Private samples
 sample_receipts/private/
 
+# Local test inputs/outputs (folders themselves are tracked via .gitkeep)
+samples/receipts_in/*
+samples/receipts_out/*
+!samples/receipts_in/.gitkeep
+!samples/receipts_out/.gitkeep
+
+# Loose CSV outputs from ad-hoc runs at repo root
+/*.csv
+/*.csv.receipt.txt
+
 # OS
 .DS_Store
 Thumbs.db
