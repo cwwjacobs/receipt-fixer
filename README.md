@@ -70,3 +70,13 @@ pip install -r requirements.txt
 python cli_smoke.py
 pytest
 ```
+
+---
+
+## Buy a prebuilt binary
+
+Don't want to build from source? A signed prebuilt binary is
+available on Gumroad: <https://fixdrawer.gumroad.com/l/receipt-fixer>
+
+The source remains free under Apache 2.0; the paid binary saves
+you the install + build step.
