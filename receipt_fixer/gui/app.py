@@ -70,6 +70,20 @@ class _LogMsg:
 
 
 @dataclass
+class _ProgressMsg:
+    """Progress update for the progress bar / status label / button text.
+
+    Emitted at scan start (current=0, total=N, filename=""), before each
+    file (current=i-1, total=N, filename=name), after each file
+    (current=i, total=N, filename=name) regardless of success/skip/fail,
+    and once the loop finishes (current=N, total=N, filename="Done").
+    """
+    current: int
+    total: int
+    filename: str = ""
+
+
+@dataclass
 class _DoneMsg:
     csv_path: Path
     receipt_path: Path
@@ -157,12 +171,15 @@ def _run_pipeline(
         ))
         return
 
+    total = len(files)
+    q.put(_ProgressMsg(current=0, total=total, filename=""))
+
     q.put(_LogMsg(""))
     q.put(_LogMsg("VERIFICATION RUN"))
     q.put(_LogMsg(SECTION_RULE))
     q.put(_LogMsg(f"Input folder:  {folder}"))
     q.put(_LogMsg(f"Output CSV:    {csv_path}"))
-    q.put(_LogMsg(f"Files seen:    {len(files)}"))
+    q.put(_LogMsg(f"Files seen:    {total}"))
     q.put(_LogMsg(""))
 
     rows: list[CsvRow] = []
@@ -172,7 +189,12 @@ def _run_pipeline(
         work_dir = Path(tmp)
         for i, rf in enumerate(files, start=1):
             seen += 1
-            label = f"[{i}/{len(files)}] {rf.path.name}"
+            label = f"[{i}/{total}] {rf.path.name}"
+            # Show the filename BEFORE work begins so OCR's multi-second
+            # latency doesn't make the GUI look frozen.
+            q.put(_ProgressMsg(
+                current=i - 1, total=total, filename=rf.path.name
+            ))
             try:
                 norm = normalize_to_png(rf, work_dir)
                 ocr_result = extract_text(norm)
@@ -201,6 +223,14 @@ def _run_pipeline(
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 q.put(_LogMsg(f"{label}  FAIL     ({exc})"))
+            finally:
+                # Advance the bar regardless of branch. Skip/fail count
+                # toward progress just as much as success.
+                q.put(_ProgressMsg(
+                    current=i, total=total, filename=rf.path.name
+                ))
+
+    q.put(_ProgressMsg(current=total, total=total, filename="Done"))
 
     try:
         write_csv(rows, csv_path, force=force)
@@ -555,25 +585,43 @@ class ReceiptFixerApp:
         )
         self._open_btn.grid(row=0, column=1)
 
+        # --- Progress row (status label, counter, determinate bar) ---
+        progress_row = ttk.Frame(outer)
+        progress_row.grid(row=6, column=0, sticky="ew", pady=(8, 4))
+        progress_row.columnconfigure(0, weight=1)
+
+        self._status_label = ttk.Label(progress_row, text="")
+        self._status_label.grid(row=0, column=0, sticky="w")
+
+        self._counter_label = ttk.Label(progress_row, text="0 / 0")
+        self._counter_label.grid(row=0, column=1, sticky="e")
+
+        self._progressbar = ttk.Progressbar(
+            progress_row, mode="determinate", maximum=1, value=0
+        )
+        self._progressbar.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0)
+        )
+
         # --- Verification log panel ---
         ttk.Label(outer, text="Verification log:").grid(
-            row=6, column=0, sticky="w", pady=(8, 2)
+            row=7, column=0, sticky="w", pady=(8, 2)
         )
         self._log_panel = ReadOnlyTextPanel(
             outer, height=LOG_PANEL_ROWS, wrap="word"
         )
-        self._log_panel.grid(row=7, column=0, sticky="nsew", pady=(0, 8))
-        outer.rowconfigure(7, weight=3)
+        self._log_panel.grid(row=8, column=0, sticky="nsew", pady=(0, 8))
+        outer.rowconfigure(8, weight=3)
 
         # --- Verified preview panel ---
         ttk.Label(outer, text="Verified output preview:").grid(
-            row=8, column=0, sticky="w", pady=(4, 2)
+            row=9, column=0, sticky="w", pady=(4, 2)
         )
         self._preview_panel = ReadOnlyTextPanel(
             outer, height=PREVIEW_PANEL_ROWS, wrap="none"
         )
-        self._preview_panel.grid(row=9, column=0, sticky="nsew")
-        outer.rowconfigure(9, weight=1)
+        self._preview_panel.grid(row=10, column=0, sticky="nsew")
+        outer.rowconfigure(10, weight=1)
 
     # --- handlers --------------------------------------------------------
 
@@ -623,7 +671,10 @@ class ReceiptFixerApp:
         self._log_panel.clear()
         self._preview_panel.clear()
         self._open_btn.configure(state="disabled")
-        self._convert_btn.configure(state="disabled")
+        self._progressbar.configure(maximum=1, value=0)
+        self._counter_label.configure(text="0 / 0")
+        self._status_label.configure(text="")
+        self._convert_btn.configure(text="Converting...", state="disabled")
 
         self._worker = threading.Thread(
             target=self._worker_entry,
@@ -658,6 +709,8 @@ class ReceiptFixerApp:
                 msg = self._queue.get_nowait()
                 if isinstance(msg, _LogMsg):
                     self._log_panel.append(msg.text)
+                elif isinstance(msg, _ProgressMsg):
+                    self._handle_progress(msg)
                 elif isinstance(msg, _DoneMsg):
                     self._handle_done(msg)
                     finished = True
@@ -669,10 +722,36 @@ class ReceiptFixerApp:
 
         worker_done = self._worker is not None and not self._worker.is_alive()
         if finished or (worker_done and self._queue.empty()):
-            self._convert_btn.configure(state=self._convert_state())
+            self._convert_btn.configure(
+                text="Convert and Verify",
+                state=self._convert_state(),
+            )
             return
 
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
+
+    def _handle_progress(self, msg: _ProgressMsg) -> None:
+        # The bar's maximum may not be known until the first ProgressMsg
+        # arrives (after scan completes), so set it on every update — Tk
+        # treats this as idempotent.
+        self._progressbar.configure(
+            maximum=max(msg.total, 1), value=msg.current
+        )
+        self._counter_label.configure(text=f"{msg.current} / {msg.total}")
+        if msg.filename == "Done":
+            self._status_label.configure(text="Done")
+        elif msg.filename:
+            self._status_label.configure(text=f"Now processing: {msg.filename}")
+        else:
+            self._status_label.configure(text="")
+
+        # Live button text. On the final tick the queue still has DoneMsg
+        # / FailureMsg pending, which restores "Convert and Verify"; here
+        # we only show the in-flight counter while work is mid-stream.
+        if msg.current < msg.total:
+            self._convert_btn.configure(
+                text=f"Converting... ({msg.current} / {msg.total})"
+            )
 
     def _handle_done(self, msg: _DoneMsg) -> None:
         self._last_csv = msg.csv_path
