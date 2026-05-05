@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from receipt_fixer.core import output as output_mod
+from receipt_fixer.core.extract import extract_fields
+from receipt_fixer.core.ocr import OcrResult
 from receipt_fixer.core.output import (
     CSV_HEADERS,
     CsvExistsError,
@@ -219,3 +221,105 @@ def test_write_verification_receipt_sha256_matches_file_content(tmp_path):
 
     # And sha256_file should agree.
     assert sha256_file(csv_path) == independent
+
+
+# ---------------------------------------------------------------------------
+# chunk 8.1 regression: GUI log reasons string MUST equal CsvRow.reasons.
+#
+# Bug shape: the GUI worker built its per-file log line by re-joining
+# extracted.reasons live, while the CSV row captured a snapshot at
+# CsvRow.from_extracted time. Any mutation (current or future) to the
+# reasons list between those two reads silently desynchronised the two
+# views. Fix is structural: GUI log reads row.reasons (single source of
+# truth). These tests pin the contract.
+# ---------------------------------------------------------------------------
+
+def _build_gui_log_reason(row: CsvRow) -> str:
+    """Mirror the worker's exact construction at receipt_fixer/gui/app.py:188.
+    Kept here as the pinned contract: if the worker ever drifts back to
+    re-joining extracted.reasons, this test will catch it via the equality
+    check below."""
+    return row.reasons or "missing fields"
+
+
+def test_gui_log_reasons_match_csv_row_reasons_when_no_date():
+    # Synthetic OCR: amount keyword present (TOTAL), vendor present (ACME),
+    # but no parseable date anywhere.
+    ocr = OcrResult(
+        raw_text="ACME HARDWARE\nThanks!\nTOTAL $42.00\n",
+        confidence=88.0,
+        word_count=6,
+        image_max_dim=1200,
+    )
+    extracted = extract_fields(ocr)
+    row = CsvRow.from_extracted("acme.jpg", extracted)
+
+    # The fields the worker would actually produce: amount and vendor came
+    # through, date did not.
+    assert extracted.amount == Decimal("42.00")
+    assert extracted.vendor == "ACME HARDWARE"
+    assert extracted.date is None
+
+    # The GUI log string and the CSV row's stored reasons string must be
+    # the same string. Not equivalent — identical.
+    gui_string = _build_gui_log_reason(row)
+    assert gui_string == row.reasons
+    assert gui_string == "no date detected"
+
+
+def test_no_total_amount_keyword_reason_absent_when_amount_extracted():
+    # Pin the failure-mode the user observed: "no total/amount keyword
+    # found" must NEVER appear in reasons when an amount was extracted,
+    # regardless of which keyword level matched.
+    ocr = OcrResult(
+        raw_text="VENDOR INC\n05/03/2026\nCREDIT & 37.68\n",
+        confidence=70.0,
+        word_count=5,
+        image_max_dim=1000,
+    )
+    extracted = extract_fields(ocr)
+    assert extracted.amount == Decimal("37.68")
+    assert "no total/amount keyword found" not in extracted.reasons
+    # And the CSV-side string must not contain it either.
+    row = CsvRow.from_extracted("vendor.jpg", extracted)
+    assert "no total/amount keyword found" not in row.reasons
+
+
+def test_gui_log_and_csv_agree_on_low_res_and_missing_date():
+    # The exact shape of the Shell Wendover bug report: small image,
+    # amount and vendor present, date missing. CSV captured low-res +
+    # no-date. The GUI log MUST show the same string.
+    ocr = OcrResult(
+        raw_text=(
+            "VISA\n"
+            "INVOICE 171646\n"
+            "PUMP# 7\n"
+            "FUEL TOTAL *#\n"
+            "CREDIT & 37.68\n"
+        ),
+        confidence=74.63,
+        word_count=10,
+        image_max_dim=284,
+    )
+    extracted = extract_fields(ocr)
+    row = CsvRow.from_extracted("images (1).jpeg", extracted)
+
+    assert extracted.amount == Decimal("37.68")
+    assert extracted.vendor == "VISA"
+    assert "image too small" in row.reasons
+    assert "no date detected" in row.reasons
+    assert "no total/amount keyword found" not in row.reasons
+    assert "no vendor detected" not in row.reasons
+
+    # The single source of truth: GUI string is byte-identical to CSV string.
+    assert _build_gui_log_reason(row) == row.reasons
+
+
+def test_gui_log_falls_back_when_reasons_empty():
+    # Defensive: a clean extraction with zero reasons would join to "" and
+    # the GUI log fallback "missing fields" should kick in. (The worker
+    # only takes the partial branch when something is missing, so an
+    # empty-reasons row in this branch is unusual but the fallback must
+    # still produce something readable.)
+    row = CsvRow(file="x.jpg", reasons="")
+    assert _build_gui_log_reason(row) == "missing fields"

@@ -185,7 +185,12 @@ def _run_pipeline(
                     q.put(_LogMsg(f"{label}  ok       conf={conf:.1f}"))
                 else:
                     partial += 1
-                    reason = "; ".join(extracted.reasons) or "missing fields"
+                    # Source-of-truth: the joined reasons string already lives
+                    # on row.reasons (captured by CsvRow.from_extracted). The
+                    # GUI log MUST display the same string the CSV holds —
+                    # never re-join extracted.reasons here, that invites
+                    # divergence if anything mutates the list later.
+                    reason = row.reasons or "missing fields"
                     q.put(_LogMsg(
                         f"{label}  partial  conf={conf:.1f}  ({reason})"
                     ))
