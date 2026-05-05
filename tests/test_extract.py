@@ -6,11 +6,12 @@ from receipt_fixer.core.extract import ExtractedReceipt, extract_fields
 from receipt_fixer.core.ocr import OcrResult
 
 
-def make_ocr(text: str, conf: float = 90.0) -> OcrResult:
+def make_ocr(text: str, conf: float = 90.0, image_max_dim: int = 0) -> OcrResult:
     return OcrResult(
         raw_text=text,
         confidence=conf,
         word_count=len(text.split()),
+        image_max_dim=image_max_dim,
     )
 
 
@@ -99,6 +100,98 @@ def test_amount_with_thousands_separator():
     text = "STORE\n05/03/2026\nGRAND TOTAL $1,234.56\n"
     result = extract_fields(make_ocr(text))
     assert result.amount == Decimal("1234.56")
+
+
+# ---------------------------------------------------------------------------
+# Glyph variants — Tesseract often misreads "$" as "S", "*", "&", or drops it.
+# Refusal logic is unchanged; only the recognition is loosened.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "glyph",
+    ["$", "S", "*", "&", ""],
+)
+def test_amount_glyph_variants(glyph):
+    text = f"VENDOR\n05/03/2026\nTOTAL {glyph} 37.68\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("37.68"), f"glyph {glyph!r} failed"
+
+
+def test_shell_fuel_receipt_real_ocr_shape():
+    # The exact OCR shape that triggered chunk 8: FUEL TOTAL line has no
+    # cents (just *#), CREDIT line carries the real total with an ampersand
+    # standing in for the dollar sign.
+    text = (
+        "VISA\n"
+        "INVOICE 171646\n"
+        "PUMP# 7\n"
+        "PREMIUM 9.739G\n"
+        "PRICE/GAL $3.799\n"
+        "FUEL TOTAL *#\n"
+        "CREDIT & 37.68\n"
+    )
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("37.68")
+
+
+def test_fuel_total_keyword_matches():
+    text = "STATION\n05/03/2026\nFUEL TOTAL $42.10\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("42.10")
+
+
+def test_credit_extracts_when_no_higher_priority():
+    text = "VENDOR\n05/03/2026\nCREDIT $25.00\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("25.00")
+
+
+def test_higher_priority_beats_credit():
+    # GRAND TOTAL (level 4) beats CREDIT (level 1) on the same receipt.
+    text = (
+        "VENDOR\n"
+        "05/03/2026\n"
+        "CREDIT $25.00\n"
+        "GRAND TOTAL $26.50\n"
+    )
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("26.50")
+
+
+def test_amount_keyword_extracts():
+    text = "VENDOR\n05/03/2026\nAMOUNT $19.99\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("19.99")
+
+
+def test_balance_due_beats_total():
+    text = (
+        "VENDOR\n"
+        "05/03/2026\n"
+        "TOTAL: $10.00\n"
+        "BALANCE DUE: $11.00\n"
+    )
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("11.00")
+
+
+# ---------------------------------------------------------------------------
+# Comma handling
+# ---------------------------------------------------------------------------
+
+def test_thousands_separator_extracts_correctly():
+    text = "VENDOR\n05/03/2026\nTOTAL $1,234.56\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount == Decimal("1234.56")
+
+
+def test_suspicious_lone_comma_refuses():
+    # "$1,23" is ambiguous (truncated US thousands? European decimal?).
+    # The extractor must refuse rather than guess.
+    text = "VENDOR\n05/03/2026\nTOTAL $1,23\n"
+    result = extract_fields(make_ocr(text))
+    assert result.amount is None
+    assert any("no total/amount keyword" in r for r in result.reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +336,36 @@ def test_confidence_floor_at_zero():
 def test_returns_extracted_receipt_dataclass():
     result = extract_fields(make_ocr("VENDOR\n05/03/2026\nTOTAL $5.00"))
     assert isinstance(result, ExtractedReceipt)
+
+
+# ---------------------------------------------------------------------------
+# Low-resolution hint — diagnostic, not a refusal. Pipeline still runs.
+# ---------------------------------------------------------------------------
+
+def test_small_image_surfaces_low_res_reason():
+    text = "VENDOR\n05/03/2026\nTOTAL $5.00\n"
+    result = extract_fields(make_ocr(text, image_max_dim=200))
+    assert any("image too small" in r for r in result.reasons)
+    # Hint, not refusal: extraction still runs and produces fields.
+    assert result.amount == Decimal("5.00")
+    assert result.date == "05/03/2026"
+
+
+def test_large_image_no_low_res_reason():
+    text = "VENDOR\n05/03/2026\nTOTAL $5.00\n"
+    result = extract_fields(make_ocr(text, image_max_dim=1200))
+    assert not any("image too small" in r for r in result.reasons)
+
+
+def test_unknown_dim_does_not_trigger_low_res_reason():
+    # image_max_dim=0 means the caller didn't populate it; do not warn.
+    text = "VENDOR\n05/03/2026\nTOTAL $5.00\n"
+    result = extract_fields(make_ocr(text, image_max_dim=0))
+    assert not any("image too small" in r for r in result.reasons)
+
+
+def test_threshold_boundary():
+    # 499 → warns, 500 → does not.
+    text = "VENDOR\n05/03/2026\nTOTAL $5.00\n"
+    assert any("image too small" in r for r in extract_fields(make_ocr(text, image_max_dim=499)).reasons)
+    assert not any("image too small" in r for r in extract_fields(make_ocr(text, image_max_dim=500)).reasons)

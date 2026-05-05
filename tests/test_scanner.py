@@ -31,6 +31,13 @@ def _make_pdf() -> bytes:
     return b"%PDF-1.4\n%%EOF\n"
 
 
+def _make_webp() -> bytes:
+    buf = io.BytesIO()
+    img = Image.new("RGB", (4, 4), color=(0, 0, 255))
+    img.save(buf, format="WEBP")
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -120,3 +127,21 @@ def test_pdf_without_pdf_extension_detected(tmp_path):
 
     results = scan_input_folder(tmp_path)
     assert results[0].format == "pdf"
+
+
+def test_webp_recognized_by_extension(tmp_path):
+    (tmp_path / "phone_screenshot.webp").write_bytes(_make_webp())
+
+    results = scan_input_folder(tmp_path)
+    assert len(results) == 1
+    assert results[0].format == "webp"
+    assert results[0].reason == ""
+
+
+def test_webp_recognized_by_magic_bytes(tmp_path):
+    # RIFF/WEBP magic should be detected regardless of extension.
+    (tmp_path / "mislabeled.jpg").write_bytes(_make_webp())
+
+    results = scan_input_folder(tmp_path)
+    assert len(results) == 1
+    assert results[0].format == "webp"

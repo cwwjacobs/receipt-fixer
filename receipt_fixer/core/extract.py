@@ -100,18 +100,44 @@ def _extract_date(text: str) -> Optional[_date]:
 
 # ---------------------------------------------------------------------------
 # Amount extraction
+#
+# Keyword priority (higher beats lower; ties at the same priority must agree
+# within _AMOUNT_TOLERANCE or the extractor refuses):
+#   4: GRAND TOTAL
+#   3: TOTAL DUE, BALANCE DUE, AMOUNT DUE
+#   2: FUEL TOTAL, TOTAL, BALANCE, CHARGED, AMOUNT, PAID
+#   1: CREDIT, AMT, DUE
+#   0 (excluded): SUBTOTAL, TAX, TIP
+#
+# Glyph variants: real-world OCR commonly substitutes "$" with "S", "*", "&",
+# or drops it entirely. The amount regex accepts any of these as the optional
+# leading currency glyph. The strict refusal logic (require cents, refuse on
+# non-USD glyphs €/£/¥, refuse on disagreement) is unchanged.
 # ---------------------------------------------------------------------------
 
 _NON_USD_RE = re.compile(r"[€£¥]")
-_AMOUNT_RE = re.compile(r"\$?\s*(\d+(?:,\d{3})*\.\d{2})\b")
 
-_GRAND_RE = re.compile(r"grand\s+total", re.IGNORECASE)
-_DUE_RE = re.compile(
-    r"\b(amount\s+due|balance\s+due|total\s+due)\b", re.IGNORECASE
+# Two accepted numeric forms:
+#   1. US with thousands separator: 1,234.56  /  12,345.67  /  1,234,567.89
+#   2. Plain US: 37.68  /  12345.67
+# A bare "1,23" form is intentionally NOT matched — it is ambiguous between
+# a typo of US thousands and European decimal convention; we refuse rather
+# than guess.
+_AMOUNT_RE = re.compile(
+    r"(?:[\$S\*&])?\s*"
+    r"(\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,6}\.\d{2})"
+    r"\b"
 )
-_TOTAL_RE = re.compile(r"\btotal\b", re.IGNORECASE)
-_BALANCE_RE = re.compile(r"\bbalance\b", re.IGNORECASE)
-_SUBTOTAL_RE = re.compile(r"\bsub[\s-]?total\b", re.IGNORECASE)
+
+_EXCLUDE_RE = re.compile(r"\b(sub[\s-]?total|tax|tip)\b", re.IGNORECASE)
+_GRAND_RE = re.compile(r"\bgrand\s+total\b", re.IGNORECASE)
+_DUE_PHRASE_RE = re.compile(
+    r"\b(total\s+due|balance\s+due|amount\s+due)\b", re.IGNORECASE
+)
+_LEVEL2_RE = re.compile(
+    r"\b(fuel\s+total|total|balance|charged|amount|paid)\b", re.IGNORECASE
+)
+_LEVEL1_RE = re.compile(r"\b(credit|amt|due)\b", re.IGNORECASE)
 
 # Disagreement tolerance: a few cents.
 _AMOUNT_TOLERANCE = Decimal("0.02")
@@ -123,16 +149,18 @@ def _extract_amount(text: str) -> tuple[Optional[Decimal], list[str]]:
 
     candidates: list[tuple[int, Decimal]] = []  # (priority, value)
     for line in text.splitlines():
-        # Skip lines that are about subtotals (unless they also say grand total,
-        # which is impossible in practice but kept defensive).
-        if _SUBTOTAL_RE.search(line) and not _GRAND_RE.search(line):
+        # Exclusion list always wins: a line containing SUBTOTAL/TAX/TIP is
+        # never used (unless it ALSO says GRAND TOTAL, which is defensive).
+        if _EXCLUDE_RE.search(line) and not _GRAND_RE.search(line):
             continue
 
         if _GRAND_RE.search(line):
+            priority = 4
+        elif _DUE_PHRASE_RE.search(line):
             priority = 3
-        elif _DUE_RE.search(line):
+        elif _LEVEL2_RE.search(line):
             priority = 2
-        elif _TOTAL_RE.search(line) or _BALANCE_RE.search(line):
+        elif _LEVEL1_RE.search(line):
             priority = 1
         else:
             continue
@@ -203,9 +231,21 @@ def _vendor_looks_junky(vendor: str) -> bool:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+# Below this threshold, OCR struggles regardless of content. Surface the
+# image-size diagnosis as a reason so the user sees *why* fields are blank
+# rather than guessing the input is unrecognizable.
+_LOW_RES_THRESHOLD = 500
+_LOW_RES_REASON = (
+    "image too small for reliable OCR (recommend ~1000px+ on the long edge)"
+)
+
+
 def extract_fields(ocr_result: OcrResult) -> ExtractedReceipt:
     text = ocr_result.raw_text
     reasons: list[str] = []
+
+    if 0 < ocr_result.image_max_dim < _LOW_RES_THRESHOLD:
+        reasons.append(_LOW_RES_REASON)
 
     parsed_date = _extract_date(text)
     if parsed_date is None:

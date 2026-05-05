@@ -36,6 +36,12 @@ def _make_heic_file(path: Path, size=(8, 8)) -> Path:
     return path
 
 
+def _make_webp_file(path: Path, size=(8, 8)) -> Path:
+    img = Image.new("RGB", size, color=(0, 200, 100))
+    img.save(path, format="WEBP")
+    return path
+
+
 def _make_pdf_file(path: Path, pages: int = 1) -> Path:
     """Build a minimal but valid multi-page PDF using only stdlib bytes arithmetic."""
     objects: list[bytes] = []
@@ -120,6 +126,17 @@ def test_heic_to_png(tmp_path):
     assert out.suffix == ".png"
     with Image.open(out) as img:
         assert img.format == "PNG"
+
+
+def test_webp_to_png(tmp_path):
+    src = _make_webp_file(tmp_path / "src.webp", size=(16, 24))
+    rf = _receipt(src, "webp")
+    out = normalize_to_png(rf, tmp_path / "work")
+
+    assert out.suffix == ".png"
+    with Image.open(out) as img:
+        assert img.format == "PNG"
+        assert img.size == (16, 24)
 
 
 def test_pdf_to_png(tmp_path):

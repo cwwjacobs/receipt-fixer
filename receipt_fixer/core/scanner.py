@@ -12,6 +12,7 @@ _PIL_FORMAT_TO_EXT: dict[str, str] = {
     "JPEG": "jpg",
     "PNG": "png",
     "HEIF": "heic",
+    "WEBP": "webp",
 }
 
 _EXT_TO_EXPECTED_PIL: dict[str, set[str]] = {
@@ -19,6 +20,7 @@ _EXT_TO_EXPECTED_PIL: dict[str, set[str]] = {
     "jpeg": {"JPEG"},
     "png": {"PNG"},
     "heic": {"HEIF"},
+    "webp": {"WEBP"},
 }
 
 

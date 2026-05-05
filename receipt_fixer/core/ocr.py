@@ -37,6 +37,7 @@ class OcrResult:
     raw_text: str
     confidence: float   # 0–100 average over words with confidence > -1
     word_count: int
+    image_max_dim: int = 0  # max(width, height) of the source image; 0 = unknown
 
 
 def extract_text(png_path: Path) -> OcrResult:
@@ -63,4 +64,5 @@ def extract_text(png_path: Path) -> OcrResult:
         raw_text=raw_text,
         confidence=round(confidence, 2),
         word_count=len(words),
+        image_max_dim=max(img.size),
     )
