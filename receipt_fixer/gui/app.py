@@ -11,6 +11,7 @@ FAILURE RISK CHECK). No apologies, no marketing copy.
 from __future__ import annotations
 
 import csv
+import errno
 import logging
 import queue
 import sys
@@ -40,6 +41,12 @@ from receipt_fixer.release import APP_BRAND, APP_NAME, APP_VERSION
 POLL_INTERVAL_MS = 50
 DEFAULT_CSV_NAME = "receipts.csv"
 LOGO_REL_PATH = "receipt_fixer/assets/receipt_fixer_logo.png"
+README_REL_PATH = "README.md"
+NOT_DO_SECTION_HEADING = "What it does NOT do"
+CREDIT_LINE = "Built by Corey J. — terminusprotocol.io"
+NOT_DO_FALLBACK = (
+    f"Could not locate README.md to render '{NOT_DO_SECTION_HEADING}'."
+)
 WINDOW_DEFAULT_SIZE = "780x680"
 WINDOW_MIN_SIZE = (720, 600)
 LOG_PANEL_ROWS = 13
@@ -122,6 +129,25 @@ def _run_pipeline(
 
     try:
         files = scan_input_folder(folder)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        q.put(_FailureMsg(
+            what_failed="Input folder not found",
+            detail=str(exc),
+            customer_impact="No CSV produced.",
+            required_fix=(
+                f"Restore {folder} or choose a different folder, then "
+                f"re-run."
+            ),
+        ))
+        return
+    except PermissionError as exc:
+        q.put(_FailureMsg(
+            what_failed="Input folder is not readable",
+            detail=str(exc),
+            customer_impact="No CSV produced.",
+            required_fix=f"Grant read access on {folder} and re-run.",
+        ))
+        return
     except Exception as exc:  # noqa: BLE001
         q.put(_FailureMsg(
             what_failed="Could not scan input folder",
@@ -195,6 +221,36 @@ def _run_pipeline(
             ),
         ))
         return
+    except PermissionError as exc:
+        q.put(_FailureMsg(
+            what_failed="Cannot write Output CSV: permission denied",
+            detail=str(exc),
+            customer_impact="No CSV produced.",
+            required_fix=(
+                f"Grant write access on {csv_path.parent} or choose a "
+                f"different output location."
+            ),
+        ))
+        return
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            q.put(_FailureMsg(
+                what_failed="Cannot write Output CSV: disk full",
+                detail=str(exc),
+                customer_impact="No CSV produced.",
+                required_fix=(
+                    f"Free up space on the volume containing "
+                    f"{csv_path.parent} and re-run."
+                ),
+            ))
+            return
+        q.put(_FailureMsg(
+            what_failed="Could not write CSV",
+            detail=f"{type(exc).__name__}: {exc}",
+            customer_impact="No CSV produced.",
+            required_fix=f"Check write permissions on {csv_path.parent}.",
+        ))
+        return
     except Exception as exc:  # noqa: BLE001
         q.put(_FailureMsg(
             what_failed="Could not write CSV",
@@ -212,6 +268,39 @@ def _run_pipeline(
             rows=rows,
             receipt_path=receipt_path,
         )
+    except PermissionError as exc:
+        q.put(_FailureMsg(
+            what_failed="Cannot write verification receipt: permission denied",
+            detail=str(exc),
+            customer_impact=(
+                "CSV is on disk but its verification receipt is missing."
+            ),
+            required_fix=f"Grant write access on {receipt_path.parent}.",
+        ))
+        return
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            q.put(_FailureMsg(
+                what_failed="Cannot write verification receipt: disk full",
+                detail=str(exc),
+                customer_impact=(
+                    "CSV is on disk but its verification receipt is missing."
+                ),
+                required_fix=(
+                    f"Free up space on the volume containing "
+                    f"{receipt_path.parent} and re-run."
+                ),
+            ))
+            return
+        q.put(_FailureMsg(
+            what_failed="Could not write verification receipt",
+            detail=f"{type(exc).__name__}: {exc}",
+            customer_impact=(
+                "CSV is on disk but its verification receipt is missing."
+            ),
+            required_fix=f"Check write permissions on {receipt_path.parent}.",
+        ))
+        return
     except Exception as exc:  # noqa: BLE001
         q.put(_FailureMsg(
             what_failed="Could not write verification receipt",
@@ -234,7 +323,7 @@ def _run_pipeline(
     q.put(_LogMsg(f"  skipped:         {skipped}"))
     q.put(_LogMsg(f"  failed:          {failed}"))
     q.put(_LogMsg(f"Output CSV:        {csv_path}"))
-    q.put(_LogMsg(f"SHA-256:           {csv_sha}"))
+    q.put(_LogMsg(f"SHA-256 ({csv_path.name}): {csv_sha}"))
     q.put(_LogMsg(f"Receipt:           {receipt_path}"))
 
     q.put(_DoneMsg(
@@ -252,6 +341,29 @@ def _run_pipeline(
 # ---------------------------------------------------------------------------
 # CSV preview helper
 # ---------------------------------------------------------------------------
+
+def _extract_readme_section(readme_text: str, heading: str) -> str:
+    """Return the body of the README section under '## {heading}' as plain
+    text. Stops at the next '## ' heading or end-of-file. Strips horizontal
+    rules ('---') and Markdown bullet markers."""
+    lines = readme_text.splitlines()
+    target = f"## {heading}".strip().lower()
+    in_section = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == target:
+            in_section = True
+            continue
+        if in_section and stripped.startswith("## "):
+            break
+        if in_section:
+            if stripped == "---":
+                continue
+            out.append(line)
+    text = "\n".join(out).strip()
+    return text
+
 
 def _read_preview(csv_path: Path, max_rows: int = 7) -> str:
     try:
@@ -285,8 +397,86 @@ class ReceiptFixerApp:
         self._last_csv: Optional[Path] = None
         self._logo_image: Optional[tk.PhotoImage] = None  # keep ref alive
 
+        self._about_logo: Optional[tk.PhotoImage] = None  # keep ref alive
+        self._build_menu()
         self._build_ui()
         self._update_convert_state()
+
+    # --- menu -----------------------------------------------------------
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="About", command=self._show_about)
+        help_menu.add_command(
+            label="What it does NOT do", command=self._show_not_do
+        )
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.configure(menu=menubar)
+
+    def _show_about(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title(f"About {APP_NAME}")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        logo_path = find_asset(LOGO_REL_PATH)
+        if logo_path is not None:
+            try:
+                self._about_logo = tk.PhotoImage(file=str(logo_path))
+                ttk.Label(frame, image=self._about_logo).pack(pady=(0, 8))
+            except tk.TclError as exc:
+                logger.warning("could not load logo at %s: %s", logo_path, exc)
+
+        ttk.Label(
+            frame, text=APP_BRAND, font=("Helvetica", 11)
+        ).pack()
+        ttk.Label(
+            frame, text=APP_NAME, font=("Helvetica", 16, "bold")
+        ).pack()
+        ttk.Label(frame, text=f"v{APP_VERSION}").pack(pady=(0, 8))
+        ttk.Label(frame, text=CREDIT_LINE).pack()
+
+        ttk.Button(frame, text="Close", command=win.destroy).pack(pady=(14, 0))
+        win.grab_set()
+
+    def _show_not_do(self) -> None:
+        body = self._load_not_do_text()
+
+        win = tk.Toplevel(self.root)
+        win.title(NOT_DO_SECTION_HEADING)
+        win.transient(self.root)
+        win.geometry("560x420")
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame, text=NOT_DO_SECTION_HEADING,
+            font=("Helvetica", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+
+        text_panel = ReadOnlyTextPanel(frame, height=18, wrap="word")
+        text_panel.pack(fill="both", expand=True)
+        text_panel.set_text(body)
+
+        ttk.Button(frame, text="Close", command=win.destroy).pack(
+            pady=(10, 0), anchor="e"
+        )
+        win.grab_set()
+
+    def _load_not_do_text(self) -> str:
+        readme = find_asset(README_REL_PATH)
+        if readme is None:
+            return NOT_DO_FALLBACK
+        try:
+            text = readme.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"Could not read README.md: {exc}"
+        section = _extract_readme_section(text, NOT_DO_SECTION_HEADING)
+        return section or NOT_DO_FALLBACK
 
     # --- layout ---------------------------------------------------------
 

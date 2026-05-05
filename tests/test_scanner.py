@@ -85,6 +85,20 @@ def test_hidden_files_skipped(tmp_path):
     assert results[0].format == "jpg"
 
 
+def test_dotfiles_skipped(tmp_path):
+    # Any name starting with "." should be silently skipped — this catches
+    # .gitkeep, .git stubs, editor swap files, etc.
+    (tmp_path / ".gitkeep").write_bytes(b"")
+    (tmp_path / ".env").write_bytes(b"SECRET=1")
+    (tmp_path / ".hidden.jpg").write_bytes(_make_jpeg())
+    (tmp_path / "real.jpg").write_bytes(_make_jpeg())
+
+    results = scan_input_folder(tmp_path)
+    assert len(results) == 1
+    assert results[0].path.name == "real.jpg"
+    assert results[0].format == "jpg"
+
+
 def test_size_bytes_populated(tmp_path):
     data = _make_jpeg()
     (tmp_path / "r.jpg").write_bytes(data)

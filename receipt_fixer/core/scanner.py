@@ -72,7 +72,7 @@ def _classify(p: Path) -> tuple[str, str]:
 def scan_input_folder(path: Path) -> list[ReceiptFile]:
     """
     Walk *path* (non-recursively) and classify every file.
-    Hidden files (.DS_Store, Thumbs.db) are silently skipped.
+    Hidden files (any name starting with ".", plus Thumbs.db) are silently skipped.
     """
     if not path.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
@@ -80,6 +80,8 @@ def scan_input_folder(path: Path) -> list[ReceiptFile]:
     results: list[ReceiptFile] = []
     for entry in sorted(path.iterdir()):
         if not entry.is_file():
+            continue
+        if entry.name.startswith("."):
             continue
         if entry.name.lower() in _HIDDEN:
             continue

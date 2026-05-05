@@ -9,32 +9,26 @@ import pytesseract
 from PIL import Image
 
 
-def tesseract_install_hint() -> str:
-    """Return install instructions appropriate to the current OS."""
-    if sys.platform.startswith("win"):
+def tesseract_install_hint(platform: str | None = None) -> str:
+    """Return install instructions appropriate to *platform* (defaults to
+    sys.platform). One line per OS so it fits cleanly in messageboxes and
+    CLI output."""
+    plat = platform if platform is not None else sys.platform
+    if plat == "win32" or plat.startswith("win"):
         return (
-            "Install Tesseract from:\n"
-            "  https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "Then add the install folder (e.g. C:\\Program Files\\Tesseract-OCR) "
-            "to your PATH."
+            "Install Tesseract from "
+            "https://github.com/UB-Mannheim/tesseract/wiki"
         )
-    if sys.platform == "darwin":
-        return (
-            "Install Tesseract via Homebrew:\n"
-            "  brew install tesseract"
-        )
-    return (
-        "Install Tesseract via your package manager:\n"
-        "  Debian/Ubuntu: sudo apt install tesseract-ocr\n"
-        "  Fedora:        sudo dnf install tesseract\n"
-        "  Arch:          sudo pacman -S tesseract"
-    )
+    if plat == "darwin":
+        return "Install Tesseract: brew install tesseract"
+    # linux* and anything else
+    return "Install Tesseract: sudo apt install tesseract-ocr"
 
 
 def _check_tesseract() -> None:
     if shutil.which("tesseract") is None:
         raise EnvironmentError(
-            "Tesseract OCR binary not found.\n\n" + tesseract_install_hint()
+            "Tesseract OCR binary not found. " + tesseract_install_hint()
         )
 
 
@@ -51,15 +45,19 @@ def extract_text(png_path: Path) -> OcrResult:
     img = Image.open(png_path)
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
 
-    # Tesseract reports -1 confidence for non-word rows; filter those out
-    word_confs = [c for c in data["conf"] if c != -1]
-    words = [
-        t for t, c in zip(data["text"], data["conf"])
+    # Tesseract reports -1 confidence for non-word rows, and sometimes emits
+    # rows with positive conf but empty/whitespace text (e.g. on blank-ish
+    # images it can return a single conf=95 row with text=''). Both must be
+    # filtered, otherwise the confidence average reflects phantom "words" the
+    # extractor has no text for.
+    scored = [
+        (t, c) for t, c in zip(data["text"], data["conf"])
         if c != -1 and t.strip()
     ]
 
     raw_text = pytesseract.image_to_string(img).strip()
-    confidence = sum(word_confs) / len(word_confs) if word_confs else 0.0
+    confidence = sum(c for _, c in scored) / len(scored) if scored else 0.0
+    words = [t for t, _ in scored]
 
     return OcrResult(
         raw_text=raw_text,

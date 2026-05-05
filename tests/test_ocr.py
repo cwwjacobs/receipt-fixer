@@ -22,12 +22,30 @@ pytestmark = pytest.mark.skipif(
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
-def _make_text_png(path: Path, text: str, size=(400, 100)) -> Path:
-    """Render *text* onto a white PNG large enough for Tesseract to read."""
+_TTF_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+)
+
+
+def _load_font():
+    for candidate in _TTF_CANDIDATES:
+        if Path(candidate).exists():
+            return ImageFont.truetype(candidate, size=32)
+    return ImageFont.load_default()
+
+
+def _make_text_png(path: Path, text: str, size=(600, 120)) -> Path:
+    """Render *text* onto a white PNG at a size Tesseract can reliably read.
+
+    PIL's default bitmap font is too small for Tesseract to consistently
+    pick up punctuation like decimal points; we use a TTF when one is
+    available on the system."""
     img = Image.new("RGB", size, color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
-    # Use default bitmap font — always available, no font files needed
-    draw.text((10, 30), text, fill=(0, 0, 0))
+    draw.text((20, 30), text, fill=(0, 0, 0), font=_load_font())
     img.save(path, format="PNG")
     return path
 
@@ -79,3 +97,17 @@ def test_word_count_positive_for_text_image(tmp_path):
     result = extract_text(png)
 
     assert result.word_count > 0
+
+
+def test_blank_image_does_not_report_phantom_confidence(tmp_path):
+    # Regression: Tesseract sometimes emits a single conf=95 / text=''
+    # row for blank-ish images. If those rows feed the average we get a
+    # high confidence with zero words — which then lands at exactly 45.0
+    # after the extractor's date/total penalties.
+    from receipt_fixer.core.ocr import extract_text
+
+    png = _make_blank_png(tmp_path / "blank.png")
+    result = extract_text(png)
+
+    if result.word_count == 0:
+        assert result.confidence == 0.0
